@@ -50,11 +50,15 @@ internal func credentialsCallback(
 	case .default:
 		result = git_cred_default_new(cred)
 	case .sshAgent:
-		result = git_cred_ssh_key_from_agent(cred, name!)
+		// SSH deferred — libgit2 is built with USE_SSH=OFF (HTTPS+PAT only, see helper/docs/git.md).
+		// Do not call git_cred_ssh_* here: those symbols require an SSH-enabled libgit2 and would
+		// fail to link. Reject the credential request instead. // wangqi modified 2026-07-07
+		result = GIT_PASSTHROUGH.rawValue
 	case .plaintext(let username, let password):
 		result = git_cred_userpass_plaintext_new(cred, username, password)
-	case .sshMemory(let username, let publicKey, let privateKey, let passphrase):
-		result = git_cred_ssh_key_memory_new(cred, username, publicKey, privateKey, passphrase)
+	case .sshMemory:
+		// SSH deferred — see .sshAgent above. // wangqi modified 2026-07-07
+		result = GIT_PASSTHROUGH.rawValue
 	}
 
 	return (result != GIT_OK.rawValue) ? -1 : 0

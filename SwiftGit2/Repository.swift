@@ -404,6 +404,60 @@ public final class Repository {
 		}
 	}
 
+	// wangqi added 2026-07-07 — libgit2 supports push and ahead/behind but SwiftGit2 never
+	// wrapped them. The app's Git sync needs push (incl. force-push for the "keep local"
+	// divergence path) and ahead/behind counts for divergence detection. See helper/docs/git.md.
+
+	/// Push local refs to a remote over HTTPS.
+	///
+	/// remoteName  - The name of the remote (e.g. "origin").
+	/// refspecs    - Refspecs to push, e.g. `["refs/heads/main:refs/heads/main"]`. Prefix a
+	///               refspec with `+` to force-push, e.g. `["+refs/heads/main:refs/heads/main"]`.
+	/// credentials - Credentials for authenticating with the remote (HTTPS username+token).
+	public func push(remoteName: String, refspecs: [String], credentials: Credentials = .default) -> Result<(), NSError> {
+		return remoteLookup(named: remoteName) { lookup in
+			lookup.flatMap { remote -> Result<(), NSError> in
+				// Build a git_strarray from the refspecs; strdup so the C strings outlive the call.
+				var cStrings: [UnsafeMutablePointer<CChar>?] = refspecs.map { strdup($0) }
+				defer { cStrings.forEach { free($0) } }
+
+				return cStrings.withUnsafeMutableBufferPointer { buffer -> Result<(), NSError> in
+					var refspecArray = git_strarray(strings: buffer.baseAddress, count: refspecs.count)
+
+					var options = git_push_options()
+					let initResult = git_push_init_options(&options, UInt32(GIT_PUSH_OPTIONS_VERSION))
+					guard initResult == GIT_OK.rawValue else {
+						return .failure(NSError(gitError: initResult, pointOfFailure: "git_push_init_options"))
+					}
+					options.callbacks.payload = credentials.toPointer()
+					options.callbacks.credentials = credentialsCallback
+
+					let result = git_remote_push(remote, &refspecArray, &options)
+					guard result == GIT_OK.rawValue else {
+						return .failure(NSError(gitError: result, pointOfFailure: "git_remote_push"))
+					}
+					return .success(())
+				}
+			}
+		}
+	}
+
+	/// Count how many commits `local` is ahead of and behind `upstream`.
+	///
+	/// Used for divergence detection: `behind == 0` means a fast-forward push is possible;
+	/// `ahead > 0 && behind > 0` is a true divergence (resolve via force-push or reset).
+	public func graphAheadBehind(local: OID, upstream: OID) -> Result<(ahead: Int, behind: Int), NSError> {
+		var ahead = 0
+		var behind = 0
+		var localOID = local.oid
+		var upstreamOID = upstream.oid
+		let result = git_graph_ahead_behind(&ahead, &behind, self.pointer, &localOID, &upstreamOID)
+		guard result == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_graph_ahead_behind"))
+		}
+		return .success((ahead: ahead, behind: behind))
+	}
+
 	// MARK: - Reference Lookups
 
 	/// Load all the references with the given prefix (e.g. "refs/heads/")
