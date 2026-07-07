@@ -452,6 +452,16 @@ public final class Repository {
 		return .success(remote)
 	}
 
+	/// Change the URL of an existing remote (re-linking a repository to a different
+	/// remote without a delete/create cycle). // wangqi modified 2026-07-07
+	public func setRemoteURL(name: String, url: String) -> Result<(), NSError> {
+		let result = git_remote_set_url(self.pointer, name, url)
+		guard result == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_remote_set_url"))
+		}
+		return .success(())
+	}
+
 	// wangqi added 2026-07-07 — libgit2 supports push and ahead/behind but SwiftGit2 never
 	// wrapped them. The app's Git sync needs push (incl. force-push for the "keep local"
 	// divergence path) and ahead/behind counts for divergence detection. See helper/docs/git.md.
