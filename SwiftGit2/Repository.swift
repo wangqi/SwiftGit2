@@ -53,7 +53,10 @@ private func checkoutOptions(strategy: CheckoutStrategy,
 	return options
 }
 
-private func fetchOptions(credentials: Credentials) -> git_fetch_options {
+// Takes a pre-created credential payload instead of creating one internally, so the caller
+// can release it after the git operation completes (the callback no longer consumes the
+// retain — see Credentials.fromPointer). // wangqi modified 2026-07-07
+private func fetchOptions(credentialsPayload: UnsafeMutableRawPointer) -> git_fetch_options {
 	let pointer = UnsafeMutablePointer<git_fetch_options>.allocate(capacity: 1)
 	git_fetch_init_options(pointer, UInt32(GIT_FETCH_OPTIONS_VERSION))
 
@@ -61,7 +64,7 @@ private func fetchOptions(credentials: Credentials) -> git_fetch_options {
 
 	pointer.deallocate()
 
-	options.callbacks.payload = credentials.toPointer()
+	options.callbacks.payload = credentialsPayload
 	options.callbacks.credentials = credentialsCallback
 
 	return options
@@ -100,13 +103,15 @@ public final class Repository {
 
 	/// Create a new repository at the given URL.
 	///
-	/// URL - The URL of the repository.
+	/// URL  - The URL of the repository.
+	/// bare - Create a bare repository (no working directory). Used for local test
+	///        fixtures acting as remotes. // wangqi modified 2026-07-07
 	///
 	/// Returns a `Result` with a `Repository` or an error.
-	public class func create(at url: URL) -> Result<Repository, NSError> {
+	public class func create(at url: URL, bare: Bool = false) -> Result<Repository, NSError> {
 		var pointer: OpaquePointer? = nil
 		let result = url.withUnsafeFileSystemRepresentation {
-			git_repository_init(&pointer, $0, 0)
+			git_repository_init(&pointer, $0, bare ? 1 : 0)
 		}
 
 		guard result == GIT_OK.rawValue else {
@@ -150,10 +155,14 @@ public final class Repository {
 	public class func clone(from remoteURL: URL, to localURL: URL, localClone: Bool = false, bare: Bool = false,
 	                        credentials: Credentials = .default, checkoutStrategy: CheckoutStrategy = .Safe,
 	                        checkoutProgress: CheckoutProgressBlock? = nil) -> Result<Repository, NSError> {
+		// Release the credential payload after the clone finishes (balances toPointer's
+		// passRetained; the callback only borrows it now). // wangqi modified 2026-07-07
+		let credentialsPayload = credentials.toPointer()
+		defer { Credentials.release(credentialsPayload) }
 		var options = cloneOptions(
 			bare: bare,
 			localClone: localClone,
-			fetchOptions: fetchOptions(credentials: credentials),
+			fetchOptions: fetchOptions(credentialsPayload: credentialsPayload),
 			checkoutOptions: checkoutOptions(strategy: checkoutStrategy, progress: checkoutProgress))
 
 		var pointer: OpaquePointer? = nil
@@ -404,6 +413,45 @@ public final class Repository {
 		}
 	}
 
+	/// Download new data and update tips, authenticating with the given credentials.
+	///
+	/// The parameterless fetch(_:) above wires no credential callback and therefore fails
+	/// against private HTTPS remotes; sync flows (pull / divergence detection) need an
+	/// authenticated fetch. // wangqi modified 2026-07-07
+	public func fetch(remoteName: String, credentials: Credentials = .default) -> Result<(), NSError> {
+		return remoteLookup(named: remoteName) { remote in
+			remote.flatMap { pointer in
+				var opts = git_fetch_options()
+				let resultInit = git_fetch_init_options(&opts, UInt32(GIT_FETCH_OPTIONS_VERSION))
+				assert(resultInit == GIT_OK.rawValue)
+				let payload = credentials.toPointer()
+				defer { Credentials.release(payload) }
+				opts.callbacks.payload = payload
+				opts.callbacks.credentials = credentialsCallback
+
+				let result = git_remote_fetch(pointer, nil, &opts, nil)
+				guard result == GIT_OK.rawValue else {
+					let err = NSError(gitError: result, pointOfFailure: "git_remote_fetch")
+					return .failure(err)
+				}
+				return .success(())
+			}
+		}
+	}
+
+	/// Add a new remote to the repository (used when publishing a local repository to an
+	/// empty remote, which cannot be cloned). // wangqi modified 2026-07-07
+	public func addRemote(name: String, url: String) -> Result<Remote, NSError> {
+		var pointer: OpaquePointer? = nil
+		let result = git_remote_create(&pointer, self.pointer, name, url)
+		guard result == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_remote_create"))
+		}
+		let remote = Remote(pointer!)
+		git_remote_free(pointer)
+		return .success(remote)
+	}
+
 	// wangqi added 2026-07-07 — libgit2 supports push and ahead/behind but SwiftGit2 never
 	// wrapped them. The app's Git sync needs push (incl. force-push for the "keep local"
 	// divergence path) and ahead/behind counts for divergence detection. See helper/docs/git.md.
@@ -429,7 +477,11 @@ public final class Repository {
 					guard initResult == GIT_OK.rawValue else {
 						return .failure(NSError(gitError: initResult, pointOfFailure: "git_push_init_options"))
 					}
-					options.callbacks.payload = credentials.toPointer()
+					// Release the payload after the push (the callback only borrows it —
+					// see Credentials.fromPointer). // wangqi modified 2026-07-07
+					let payload = credentials.toPointer()
+					defer { Credentials.release(payload) }
+					options.callbacks.payload = payload
 					options.callbacks.credentials = credentialsCallback
 
 					let result = git_remote_push(remote, &refspecArray, &options)
@@ -582,6 +634,39 @@ public final class Repository {
 		return Result.success(())
 	}
 
+	/// Set HEAD to the given reference name, which may be an unborn branch (e.g.
+	/// "refs/heads/main" right after init, before the first commit). The typed
+	/// setHEAD(_ reference:) overload cannot express that because the reference does not
+	/// exist yet. // wangqi modified 2026-07-07
+	public func setHEAD(named longName: String) -> Result<(), NSError> {
+		let result = git_repository_set_head(self.pointer, longName)
+		guard result == GIT_OK.rawValue else {
+			return Result.failure(NSError(gitError: result, pointOfFailure: "git_repository_set_head"))
+		}
+		return Result.success(())
+	}
+
+	/// Move a direct reference (e.g. a local branch "refs/heads/main") to a new target OID.
+	/// Needed for fast-forward pull: advancing the branch ref keeps HEAD symbolically
+	/// attached to the branch, whereas setHEAD(oid) would detach it. // wangqi modified 2026-07-07
+	public func setTarget(referenceLongName: String, to oid: OID, reflogMessage: String? = nil) -> Result<(), NSError> {
+		var refPointer: OpaquePointer? = nil
+		let lookupResult = git_reference_lookup(&refPointer, self.pointer, referenceLongName)
+		guard lookupResult == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: lookupResult, pointOfFailure: "git_reference_lookup"))
+		}
+		defer { git_reference_free(refPointer) }
+
+		var newRef: OpaquePointer? = nil
+		var oidCopy = oid.oid
+		let result = git_reference_set_target(&newRef, refPointer, &oidCopy, reflogMessage)
+		guard result == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_reference_set_target"))
+		}
+		git_reference_free(newRef)
+		return .success(())
+	}
+
 	/// Check out HEAD.
 	///
 	/// :param: strategy The checkout strategy to use.
@@ -666,6 +751,40 @@ public final class Repository {
 				return .failure(NSError(gitError: writeResult, pointOfFailure: "git_index_write"))
 			}
 			return .success(())
+		}
+	}
+
+	/// Update all index entries to match the working directory, staging modifications and
+	/// deletions of already-tracked files. git_index_add_all alone does not stage deletions;
+	/// add(path:) + updateAll() together emulate `git add -A`. // wangqi modified 2026-07-07
+	public func updateAll() -> Result<(), NSError> {
+		return unsafeIndex().flatMap { index in
+			defer { git_index_free(index) }
+			var paths = git_strarray(strings: nil, count: 0)
+			let updateResult = git_index_update_all(index, &paths, nil, nil)
+			guard updateResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: updateResult, pointOfFailure: "git_index_update_all"))
+			}
+			let writeResult = git_index_write(index)
+			guard writeResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: writeResult, pointOfFailure: "git_index_write"))
+			}
+			return .success(())
+		}
+	}
+
+	/// Perform a commit of the staged files as the repository's initial commit (unborn HEAD,
+	/// no parent). commit(message:signature:) requires an existing HEAD parent and fails on
+	/// a freshly-initialized repository. // wangqi modified 2026-07-07
+	public func commitInitial(message: String, signature: Signature) -> Result<Commit, NSError> {
+		return unsafeIndex().flatMap { index in
+			defer { git_index_free(index) }
+			var treeOID = git_oid()
+			let treeResult = git_index_write_tree(&treeOID, index)
+			guard treeResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: treeResult, pointOfFailure: "git_index_write_tree"))
+			}
+			return commit(tree: OID(treeOID), parents: [], message: message, signature: signature)
 		}
 	}
 
