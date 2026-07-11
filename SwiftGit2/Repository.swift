@@ -53,10 +53,94 @@ private func checkoutOptions(strategy: CheckoutStrategy,
 	return options
 }
 
-// Takes a pre-created credential payload instead of creating one internally, so the caller
-// can release it after the git operation completes (the callback no longer consumes the
-// retain — see Credentials.fromPointer). // wangqi modified 2026-07-07
-private func fetchOptions(credentialsPayload: UnsafeMutableRawPointer) -> git_fetch_options {
+// Progress + cooperative cancellation for network transfers (clone / fetch / push).
+// libgit2's git_remote_callbacks exposes a single shared `payload` for all callbacks, so
+// credentials and the transfer-progress/cancel hooks must read from one combined box. The
+// app's global GitSyncCenter drives a determinate Live Activity from onProgress and aborts a
+// stalled or user-cancelled transfer through shouldCancel. See helper/docs/git.md.
+// wangqi added 2026-07-10
+public final class GitTransferContext {
+	/// Fractional transfer progress in 0...1, invoked on libgit2's transfer thread.
+	public var onProgress: ((Double) -> Void)?
+	/// Return true to abort the in-flight transfer (libgit2 surfaces GIT_EUSER).
+	public var shouldCancel: (() -> Bool)?
+	public init(onProgress: ((Double) -> Void)? = nil, shouldCancel: (() -> Bool)? = nil) {
+		self.onProgress = onProgress
+		self.shouldCancel = shouldCancel
+	}
+}
+
+// Combined libgit2 remote-callbacks payload: the credentials to authenticate with plus the
+// optional progress/cancel context. Retained across the blocking call and released once by the
+// operation that created it. // wangqi added 2026-07-10
+private final class RemoteCallbacksBox {
+	let credentials: Credentials
+	let context: GitTransferContext?
+	init(_ credentials: Credentials, _ context: GitTransferContext?) {
+		self.credentials = credentials
+		self.context = context
+	}
+	func toPointer() -> UnsafeMutableRawPointer { Unmanaged.passRetained(self).toOpaque() }
+	static func fromPointer(_ p: UnsafeMutableRawPointer) -> RemoteCallbacksBox {
+		Unmanaged<RemoteCallbacksBox>.fromOpaque(UnsafeRawPointer(p)).takeUnretainedValue()
+	}
+	static func release(_ p: UnsafeMutableRawPointer) {
+		Unmanaged<RemoteCallbacksBox>.fromOpaque(UnsafeRawPointer(p)).release()
+	}
+}
+
+// Credentials callback reading the combined box (git_cred_acquire_cb signature). Mirrors the
+// switch in credentialsCallback but sources the credentials from the box. libgit2 may retry
+// auth, so the payload is only borrowed here. // wangqi added 2026-07-10
+private func boxCredentialsCallback(
+	cred: UnsafeMutablePointer<UnsafeMutablePointer<git_cred>?>?,
+	url: UnsafePointer<CChar>?,
+	username: UnsafePointer<CChar>?,
+	_: UInt32,
+	payload: UnsafeMutableRawPointer?) -> Int32 {
+	let result: Int32
+	switch RemoteCallbacksBox.fromPointer(payload!).credentials {
+	case .default:
+		result = git_cred_default_new(cred)
+	case .sshAgent, .sshMemory:
+		// SSH deferred (USE_SSH=OFF) — reject like credentialsCallback. // wangqi modified 2026-07-10
+		result = GIT_PASSTHROUGH.rawValue
+	case .plaintext(let username, let password):
+		result = git_cred_userpass_plaintext_new(cred, username, password)
+	}
+	return (result != GIT_OK.rawValue) ? -1 : 0
+}
+
+// Fetch/clone transfer progress (git_indexer_progress_cb). Reports received/total objects and
+// aborts (non-zero return) when the context asks to cancel. // wangqi added 2026-07-10
+private func fetchTransferProgressCallback(stats: UnsafePointer<git_indexer_progress>?,
+                                           payload: UnsafeMutableRawPointer?) -> Int32 {
+	guard let payload = payload else { return 0 }
+	let box = RemoteCallbacksBox.fromPointer(payload)
+	if let shouldCancel = box.context?.shouldCancel, shouldCancel() { return -1 }
+	if let stats = stats?.pointee, let report = box.context?.onProgress {
+		let total = Double(stats.total_objects)
+		if total > 0 { report(min(1.0, Double(stats.received_objects) / total)) }
+	}
+	return 0
+}
+
+// Push transfer progress (git_push_transfer_progress_cb). // wangqi added 2026-07-10
+private func pushTransferProgressCallback(current: UInt32, total: UInt32, bytes: Int,
+                                          payload: UnsafeMutableRawPointer?) -> Int32 {
+	guard let payload = payload else { return 0 }
+	let box = RemoteCallbacksBox.fromPointer(payload)
+	if let shouldCancel = box.context?.shouldCancel, shouldCancel() { return -1 }
+	if total > 0, let report = box.context?.onProgress {
+		report(min(1.0, Double(current) / Double(total)))
+	}
+	return 0
+}
+
+// Takes a pre-created combined-callbacks box pointer instead of a bare credential payload, so
+// the caller can release it after the git operation completes and the transfer-progress/cancel
+// hooks share the same payload as credentials. // wangqi modified 2026-07-10
+private func fetchOptions(callbacksPayload: UnsafeMutableRawPointer) -> git_fetch_options {
 	let pointer = UnsafeMutablePointer<git_fetch_options>.allocate(capacity: 1)
 	git_fetch_init_options(pointer, UInt32(GIT_FETCH_OPTIONS_VERSION))
 
@@ -64,8 +148,9 @@ private func fetchOptions(credentialsPayload: UnsafeMutableRawPointer) -> git_fe
 
 	pointer.deallocate()
 
-	options.callbacks.payload = credentialsPayload
-	options.callbacks.credentials = credentialsCallback
+	options.callbacks.payload = callbacksPayload
+	options.callbacks.credentials = boxCredentialsCallback
+	options.callbacks.transfer_progress = fetchTransferProgressCallback
 
 	return options
 }
@@ -152,17 +237,19 @@ public final class Repository {
 	/// checkoutProgress - A block that's called with the progress of the checkout.
 	///
 	/// Returns a `Result` with a `Repository` or an error.
+	/// transferContext - Optional progress/cancel hook for the network download phase. // wangqi modified 2026-07-10
 	public class func clone(from remoteURL: URL, to localURL: URL, localClone: Bool = false, bare: Bool = false,
 	                        credentials: Credentials = .default, checkoutStrategy: CheckoutStrategy = .Safe,
-	                        checkoutProgress: CheckoutProgressBlock? = nil) -> Result<Repository, NSError> {
-		// Release the credential payload after the clone finishes (balances toPointer's
-		// passRetained; the callback only borrows it now). // wangqi modified 2026-07-07
-		let credentialsPayload = credentials.toPointer()
-		defer { Credentials.release(credentialsPayload) }
+	                        checkoutProgress: CheckoutProgressBlock? = nil,
+	                        transferContext: GitTransferContext? = nil) -> Result<Repository, NSError> {
+		// Combined credentials + progress/cancel box, released once after the clone finishes
+		// (balances toPointer's passRetained; the callbacks only borrow it). // wangqi modified 2026-07-10
+		let callbacksPayload = RemoteCallbacksBox(credentials, transferContext).toPointer()
+		defer { RemoteCallbacksBox.release(callbacksPayload) }
 		var options = cloneOptions(
 			bare: bare,
 			localClone: localClone,
-			fetchOptions: fetchOptions(credentialsPayload: credentialsPayload),
+			fetchOptions: fetchOptions(callbacksPayload: callbacksPayload),
 			checkoutOptions: checkoutOptions(strategy: checkoutStrategy, progress: checkoutProgress))
 
 		var pointer: OpaquePointer? = nil
@@ -418,16 +505,20 @@ public final class Repository {
 	/// The parameterless fetch(_:) above wires no credential callback and therefore fails
 	/// against private HTTPS remotes; sync flows (pull / divergence detection) need an
 	/// authenticated fetch. // wangqi modified 2026-07-07
-	public func fetch(remoteName: String, credentials: Credentials = .default) -> Result<(), NSError> {
+	/// transferContext - Optional progress/cancel hook for the fetch. // wangqi modified 2026-07-10
+	public func fetch(remoteName: String, credentials: Credentials = .default,
+	                  transferContext: GitTransferContext? = nil) -> Result<(), NSError> {
 		return remoteLookup(named: remoteName) { remote in
 			remote.flatMap { pointer in
 				var opts = git_fetch_options()
 				let resultInit = git_fetch_init_options(&opts, UInt32(GIT_FETCH_OPTIONS_VERSION))
 				assert(resultInit == GIT_OK.rawValue)
-				let payload = credentials.toPointer()
-				defer { Credentials.release(payload) }
+				// Combined credentials + progress/cancel box. // wangqi modified 2026-07-10
+				let payload = RemoteCallbacksBox(credentials, transferContext).toPointer()
+				defer { RemoteCallbacksBox.release(payload) }
 				opts.callbacks.payload = payload
-				opts.callbacks.credentials = credentialsCallback
+				opts.callbacks.credentials = boxCredentialsCallback
+				opts.callbacks.transfer_progress = fetchTransferProgressCallback
 
 				let result = git_remote_fetch(pointer, nil, &opts, nil)
 				guard result == GIT_OK.rawValue else {
@@ -472,7 +563,9 @@ public final class Repository {
 	/// refspecs    - Refspecs to push, e.g. `["refs/heads/main:refs/heads/main"]`. Prefix a
 	///               refspec with `+` to force-push, e.g. `["+refs/heads/main:refs/heads/main"]`.
 	/// credentials - Credentials for authenticating with the remote (HTTPS username+token).
-	public func push(remoteName: String, refspecs: [String], credentials: Credentials = .default) -> Result<(), NSError> {
+	/// transferContext - Optional progress/cancel hook for the push. // wangqi modified 2026-07-10
+	public func push(remoteName: String, refspecs: [String], credentials: Credentials = .default,
+	                 transferContext: GitTransferContext? = nil) -> Result<(), NSError> {
 		return remoteLookup(named: remoteName) { lookup in
 			lookup.flatMap { remote -> Result<(), NSError> in
 				// Build a git_strarray from the refspecs; strdup so the C strings outlive the call.
@@ -487,12 +580,12 @@ public final class Repository {
 					guard initResult == GIT_OK.rawValue else {
 						return .failure(NSError(gitError: initResult, pointOfFailure: "git_push_init_options"))
 					}
-					// Release the payload after the push (the callback only borrows it —
-					// see Credentials.fromPointer). // wangqi modified 2026-07-07
-					let payload = credentials.toPointer()
-					defer { Credentials.release(payload) }
+					// Combined credentials + progress/cancel box, released once after the push. // wangqi modified 2026-07-10
+					let payload = RemoteCallbacksBox(credentials, transferContext).toPointer()
+					defer { RemoteCallbacksBox.release(payload) }
 					options.callbacks.payload = payload
-					options.callbacks.credentials = credentialsCallback
+					options.callbacks.credentials = boxCredentialsCallback
+					options.callbacks.push_transfer_progress = pushTransferProgressCallback
 
 					let result = git_remote_push(remote, &refspecArray, &options)
 					guard result == GIT_OK.rawValue else {
